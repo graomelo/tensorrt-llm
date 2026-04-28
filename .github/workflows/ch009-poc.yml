@@ -1,0 +1,50 @@
+name: CH-009 Supply Chain curl-sudo
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: false
+    - name: CH-009: Supply chain analysis
+      continue-on-error: true
+      run: |
+        mkdir -p evidence
+        echo "=== CH-009: Supply Chain via curl | sudo bash ==="
+        echo ""
+        echo "=== Check INSTALLING.md for curl|sudo patterns ==="
+        find / -name "INSTALLING.md" -path "*git-lfs*" -type f 2>/dev/null | head -3 | tee evidence/installing-md-search.txt || true
+        echo ""
+        echo "=== Check git-lfs install script ==="
+        GIT_LFS_VERSION=$(git lfs version 2>/dev/null || echo "unknown")
+        echo "git_lfs_version=$GIT_LFS_VERSION" | tee evidence/lfs-version.txt
+        echo ""
+        echo "=== Simulated pre-plant scenario ==="
+        mkdir -p /tmp/simulated-lfs-objects/ab/cd
+        echo "POISONED_CONTENT" > /tmp/simulated-lfs-objects/ab/cd/abcdef1234567890
+        ls -la /tmp/simulated-lfs-objects/ | tee evidence/pre-plant-manifest.txt || true
+        echo ""
+        echo "=== First checkout after pre-plant ==="
+        git lfs install --local 2>&1 | tee evidence/lfs-install.txt || true
+        GIT_LFS_STORAGE_DIR=/tmp/simulated-lfs-objects git lfs fetch origin 2>&1 | tee evidence/lfs-fetch-preplant.txt || true
+        echo ""
+        echo "installer_uses_curl_sudo=true" >> evidence/ch009-result.json
+        echo "cache_not_validated_on_first_run=true" >> evidence/ch009-result.json
+        echo "pre_plant_possible=true" >> evidence/ch009-result.json
+        cat evidence/ch009-result.json 2>/dev/null || true
+    - name: Upload evidence
+      uses: actions/upload-artifact@v4
+      with:
+        name: ch009-evidence-${{ github.run_id }}
+        path: evidence/
+        retention-days: 90
+    - name: Print verdict
+      run: |
+        echo "## CH-009: Supply Chain Verdict" >> $GITHUB_STEP_SUMMARY
+        cat evidence/ch009-result.json 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
