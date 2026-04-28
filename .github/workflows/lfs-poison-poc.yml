@@ -36,7 +36,7 @@ jobs:
     - name: Record baseline hash
       run: |
         mkdir -p evidence
-        git lfs checkout --include "docs/source/blogs/media/tech_blog3_mla_absorb.png" 2>/dev/null || true
+        git lfs checkout 2>/dev/null || true
         SHA=$(sha256sum docs/source/blogs/media/tech_blog3_mla_absorb.png 2>/dev/null | awk '{print $1}')
         echo "baseline_sha256=$SHA" | tee evidence/baseline-hash.txt
         echo ""
@@ -137,7 +137,7 @@ jobs:
         echo "lfs_fetch_rc=$?" >> evidence/lfs-fetch-rc.txt
         echo ""
         echo "=== git lfs checkout ==="
-        git lfs checkout --include "docs/source/blogs/media/tech_blog3_mla_absorb.png" 2>&1 | tee evidence/lfs-checkout.txt || true
+        git lfs checkout 2>&1 | tee evidence/lfs-checkout.txt || true
         echo "lfs_checkout_rc=$?" >> evidence/lfs-checkout-rc.txt
 
     - name: V2 - Integrity guarantee check
