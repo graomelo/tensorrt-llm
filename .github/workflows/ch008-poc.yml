@@ -1,0 +1,60 @@
+name: CH-008 Subshell Scope Loss
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  subshell-scope:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: false
+    - name: Install git-lfs
+      run: |
+        mkdir -p evidence
+        git lfs install --local 2>&1 | tee evidence/lfs-install.txt
+    - name: CH-008: Subshell scope loss demonstration
+      continue-on-error: true
+      run: |
+        mkdir -p evidence
+        echo "=== CH-008: Subshell Scope Loss ==="
+        echo ""
+        echo "Pattern 1: Variable set in subshell (pipe) - lost"
+        echo "BEFORE_PIPE: VERIFY_OK=unset"
+        VERIFY_OK="unset"
+        echo "test" | VERIFY_OK="true"
+        echo "AFTER_PIPE: VERIFY_OK=$VERIFY_OK" | tee evidence/ch008-pipe-scope.txt
+        echo ""
+        echo "Pattern 2: Variable set in ( subshell ) - lost"
+        VERIFY_OK="unset"
+        ( VERIFY_OK="true"; echo "Inside subshell: VERIFY_OK=$VERIFY_OK" | tee -a evidence/ch008-subshell-scope.txt )
+        echo "Outside subshell: VERIFY_OK=$VERIFY_OK" | tee -a evidence/ch008-subshell-scope.txt
+        echo ""
+        echo "Pattern 3: Variable set in { group; } - preserved"
+        VERIFY_OK="unset"
+        { VERIFY_OK="true"; echo "Inside group: VERIFY_OK=$VERIFY_OK" | tee -a evidence/ch008-group-scope.txt; }
+        echo "Outside group: VERIFY_OK=$VERIFY_OK" | tee -a evidence/ch008-group-scope.txt
+        echo ""
+        echo "=== Simulated gate bypass ==="
+        VERIFY_OK="unset"
+        ( git lfs fsck 2>/dev/null && VERIFY_OK="true" )
+        if [ "$VERIFY_OK" = "true" ]; then
+          echo "gate_result=PASSED_VERIFICATION" >> evidence/ch008-result.json
+        else
+          echo "gate_result=BYPASSED_VERIFICATION_FLAG_LOST" >> evidence/ch008-result.json
+        fi
+        echo "verify_ok=$VERIFY_OK" >> evidence/ch008-result.json
+        cat evidence/ch008-result.json 2>/dev/null || true
+    - name: Upload evidence
+      uses: actions/upload-artifact@v4
+      with:
+        name: ch008-evidence-${{ github.run_id }}
+        path: evidence/
+        retention-days: 90
+    - name: Print verdict
+      run: |
+        echo "## CH-008: Subshell Scope Loss Verdict" >> $GITHUB_STEP_SUMMARY
+        cat evidence/ch008-result.json 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
