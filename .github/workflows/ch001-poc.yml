@@ -1,0 +1,124 @@
+name: CH-001 PoisonShell
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: false
+    - name: Fetch LFS + record baseline
+      env:
+        GIT_LFS_SKIP_SMUDGE: "1"
+      run: |
+        mkdir -p evidence
+        git lfs install --local
+        git lfs fetch origin 2>&1 | tee evidence/baseline-lfs-fetch.txt
+        git lfs checkout 2>/dev/null || true
+        git lfs ls-files --long > evidence/lfs-ls-files.txt 2>/dev/null || true
+        find .git/lfs/objects -type f | sort > evidence/lfs-cache-manifest.txt 2>/dev/null || true
+        for f in $(git lfs ls-files 2>/dev/null | awk '{print $2}' | head -5); do
+          if [ -f "$f" ]; then
+            sha256sum "$f" >> evidence/baseline-hashes.txt 2>/dev/null || true
+          fi
+        done
+    - name: Save LFS cache
+      uses: actions/cache/save@v4
+      with:
+        path: .git/lfs
+        key: ch001-lfs-${{ github.run_id }}-baseline
+    - name: Upload baseline
+      uses: actions/upload-artifact@v4
+      with:
+        name: ch001-baseline-${{ github.run_id }}
+        path: evidence/
+        retention-days: 90
+
+  poison:
+    needs: baseline
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: false
+    - name: Restore LFS cache
+      uses: actions/cache/restore@v4
+      with:
+        path: .git/lfs
+        key: ch001-lfs-${{ github.run_id }}-baseline
+    - name: Poison LFS cache (same size, different sha256)
+      run: |
+        mkdir -p evidence
+        echo "=== CH-001: PoisonShell ==="
+        find .git/lfs/objects -type f 2>/dev/null | sort | while read obj; do
+          ORIGINAL_SIZE=$(stat -c%s "$obj")
+          ORIGINAL_SHA=$(sha256sum "$obj" | awk '{print $1}')
+          dd if=/dev/urandom of="$obj" bs=1 count="$ORIGINAL_SIZE" 2>/dev/null
+          POISON_SHA=$(sha256sum "$obj" | awk '{print $1}')
+          echo "$obj original=$ORIGINAL_SHA poison=$POISON_SHA size=$ORIGINAL_SIZE" >> evidence/poison-manifest.txt
+        done
+        echo "poison_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> evidence/poison-manifest.txt
+    - name: Save poisoned cache
+      uses: actions/cache/save@v4
+      with:
+        path: .git/lfs
+        key: ch001-lfs-${{ github.run_id }}-poison
+    - name: Upload poison evidence
+      uses: actions/upload-artifact@v4
+      with:
+        name: ch001-poison-${{ github.run_id }}
+        path: evidence/
+        retention-days: 90
+
+  attack:
+    needs: poison
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: false
+    - name: Restore poisoned LFS cache
+      uses: actions/cache/restore@v4
+      with:
+        path: .git/lfs
+        key: ch001-lfs-${{ github.run_id }}-poison
+    - name: git lfs fetch + checkout (consume poisoned cache)
+      continue-on-error: true
+      run: |
+        mkdir -p evidence
+        git lfs install --local
+        git lfs fetch origin 2>&1 | tee evidence/lfs-fetch.txt || true
+        git lfs checkout 2>&1 | tee evidence/lfs-checkout.txt || true
+        echo "lfs_checkout_rc=$?" >> evidence/lfs-checkout-rc.txt
+    - name: V1 - PoisonShell check (LFS-tracked script content)
+      run: |
+        mkdir -p evidence
+        echo "=== CH-001: PoisonShell ==="
+        LFS_RC=$(cat evidence/lfs-checkout-rc.txt 2>/dev/null | tr -dc '0-9' | tail -c1)
+        for f in $(git lfs ls-files 2>/dev/null | awk '{print $2}' | head -5); do
+          if [ -f "$f" ]; then
+            POINTER_OID=$(git cat-file -p "HEAD:$f" 2>/dev/null | grep 'oid sha256:' | sed 's/oid sha256://' | tr -d '[:space:]')
+            ACTUAL_SHA=$(sha256sum "$f" 2>/dev/null | awk '{print $1}')
+            MATCH="false"
+            if [ -n "$POINTER_OID" ] && [ "$ACTUAL_SHA" = "$POINTER_OID" ]; then
+              MATCH="true"
+            fi
+            echo "file=$f pointer_oid=$POINTER_OID actual_sha=$ACTUAL_SHA oid_match=$MATCH lfs_checkout_rc=$LFS_RC" >> evidence/ch001-result.json
+          fi
+        done
+        cat evidence/ch001-result.json 2>/dev/null || true
+    - name: Upload attack evidence
+      uses: actions/upload-artifact@v4
+      with:
+        name: ch001-attack-${{ github.run_id }}
+        path: evidence/
+        retention-days: 90
+    - name: Print verdict
+      run: |
+        echo "## CH-001: PoisonShell Verdict" >> $GITHUB_STEP_SUMMARY
+        cat evidence/ch001-result.json 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
