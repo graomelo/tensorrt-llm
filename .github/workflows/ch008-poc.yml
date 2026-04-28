@@ -16,7 +16,7 @@ jobs:
       run: |
         mkdir -p evidence
         git lfs install --local 2>&1 | tee evidence/lfs-install.txt
-    - name: CH-008: Subshell scope loss demonstration
+    - name: CH-008 - Subshell scope loss demonstration
       continue-on-error: true
       run: |
         mkdir -p evidence
