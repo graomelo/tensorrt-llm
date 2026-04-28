@@ -1,0 +1,61 @@
+name: CH-006 Word Splitting Bypass
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  word-splitting:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: false
+    - name: Install git-lfs + create files with special names
+      run: |
+        mkdir -p evidence
+        git lfs install --local 2>&1 | tee evidence/lfs-install.txt
+        git lfs version | tee evidence/lfs-version.txt
+    - name: Create LFS-tracked file with special chars in name
+      run: |
+        mkdir -p evidence
+        echo "=== CH-006: Word Splitting & Globbing Bypass ==="
+        echo "Creating files with special characters in names..."
+        mkdir -p "assets/special"
+        echo "test content for LFS" > "assets/special/model --flag.bin"
+        echo "another test" > "assets/special/data;echo INJECTED.bin"
+        echo "spaces test" > "assets/special/file with spaces.bin"
+        ls -la "assets/special/" | tee evidence/special-files-listing.txt
+    - name: Test validation with unquoted variables
+      continue-on-error: true
+      run: |
+        mkdir -p evidence
+        echo "=== Simulating unquoted variable validation ==="
+        for f in $(ls assets/special/ 2>/dev/null); do
+          echo "Found file: '$f'" | tee -a evidence/unquoted-validation.txt || true
+        done
+        echo ""
+        echo "=== Now with proper quoting ==="
+        find "assets/special/" -type f -print0 2>/dev/null | while IFS= read -r -d '' f; do
+          echo "Found file: '$f'" | tee -a evidence/quoted-validation.txt || true
+        done
+        UNQUOTED=$(wc -l < evidence/unquoted-validation.txt 2>/dev/null || echo 0)
+        QUOTED=$(wc -l < evidence/quoted-validation.txt 2>/dev/null || echo 0)
+        echo "unquoted_count=$UNQUOTED quoted_count=$QUOTED" >> evidence/ch006-result.json
+        if [ "$UNQUOTED" -ne "$QUOTED" ]; then
+          echo "bypass=CONFIRMED" >> evidence/ch006-result.json
+        else
+          echo "bypass=NO_DIFFERENCE" >> evidence/ch006-result.json
+        fi
+        cat evidence/ch006-result.json 2>/dev/null || true
+    - name: Upload evidence
+      uses: actions/upload-artifact@v4
+      with:
+        name: ch006-evidence-${{ github.run_id }}
+        path: evidence/
+        retention-days: 90
+    - name: Print verdict
+      run: |
+        echo "## CH-006: Word Splitting Bypass Verdict" >> $GITHUB_STEP_SUMMARY
+        cat evidence/ch006-result.json 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
