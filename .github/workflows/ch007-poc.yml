@@ -1,0 +1,88 @@
+name: CH-007 Exit Code Masking
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  exit-code-masking:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: false
+    - name: Install git-lfs
+      run: |
+        mkdir -p evidence
+        git lfs install --local 2>&1 | tee evidence/lfs-install.txt
+    - name: Poison LFS cache
+      env:
+        GIT_LFS_SKIP_SMUDGE: "1"
+      run: |
+        mkdir -p evidence
+        git lfs fetch origin 2>&1 | tee evidence/lfs-fetch.txt || true
+        git lfs checkout 2>/dev/null || true
+        find .git/lfs/objects -type f 2>/dev/null | sort | while read obj; do
+          ORIGINAL_SIZE=$(stat -c%s "$obj")
+          dd if=/dev/urandom of="$obj" bs=1 count="$ORIGINAL_SIZE" 2>/dev/null
+        done
+    - name: Save poisoned cache
+      uses: actions/cache/save@v4
+      with:
+        path: .git/lfs
+        key: ch007-lfs-${{ github.run_id }}-poison
+
+  verify-masking:
+    needs: exit-code-masking
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: false
+    - name: Restore poisoned cache
+      uses: actions/cache/restore@v4
+      with:
+        path: .git/lfs
+        key: ch007-lfs-${{ github.run_id }}-poison
+    - name: CH-007: Test flawed error handling patterns
+      continue-on-error: true
+      run: |
+        mkdir -p evidence
+        git lfs install --local
+        echo "=== CH-007: Exit Code Masking ==="
+        echo ""
+        echo "Pattern 1: cmd && cmd2 || fallback"
+        git lfs checkout && echo "OK" || echo "FALLBACK_EXECUTED"
+        P1_RC=$?
+        echo "pattern1_rc=$P1_RC" >> evidence/ch007-pattern1.json
+        echo ""
+        echo "Pattern 2: Direct exit code check"
+        git lfs checkout 2>&1 | tee evidence/ch007-checkout.txt || true
+        DIRECT_RC=$?
+        echo "pattern2_direct_rc=$DIRECT_RC" >> evidence/ch007-pattern2.json
+        echo ""
+        echo "Pattern 3: $? after intermediate echo"
+        git lfs checkout 2>/dev/null || true
+        ECHO_RC=$?
+        echo "echo_intermediate_captured_rc=$ECHO_RC" >> evidence/ch007-pattern3.json
+        echo ""
+        echo "=== Integrity check ==="
+        for f in $(git lfs ls-files 2>/dev/null | awk '{print $2}' | head -3); do
+          if [ -f "$f" ]; then
+            POINTER_OID=$(git cat-file -p "HEAD:$f" 2>/dev/null | grep 'oid sha256:' | sed 's/oid sha256://' | tr -d '[:space:]')
+            ACTUAL_SHA=$(sha256sum "$f" 2>/dev/null | awk '{print $1}')
+            echo "file=$f pointer_oid=$POINTER_OID actual_sha=$ACTUAL_SHA oid_match=$([ "$ACTUAL_SHA" = "$POINTER_OID" ] && echo true || echo false) checkout_rc=$DIRECT_RC" >> evidence/ch007-result.json
+          fi
+        done
+        cat evidence/ch007-result.json 2>/dev/null || true
+    - name: Upload evidence
+      uses: actions/upload-artifact@v4
+      with:
+        name: ch007-evidence-${{ github.run_id }}
+        path: evidence/
+        retention-days: 90
+    - name: Print verdict
+      run: |
+        echo "## CH-007: Exit Code Masking Verdict" >> $GITHUB_STEP_SUMMARY
+        cat evidence/ch007-result.json 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
