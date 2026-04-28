@@ -60,7 +60,7 @@ jobs:
       with:
         path: .git/lfs
         key: ch002-shared-lfs-cache
-    - name: Job B: git lfs fetch + checkout (trusts pre-existing objects)
+    - name: Job B - git lfs fetch + checkout (trusts pre-existing objects)
       continue-on-error: true
       run: |
         mkdir -p evidence
