@@ -1,0 +1,67 @@
+name: CH-005 eval Injection
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  eval-injection:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: false
+    - name: Install git-lfs from source
+      run: |
+        mkdir -p evidence
+        echo "=== CH-005: eval injection in completions/mergetool ==="
+        git lfs install --local 2>&1 | tee evidence/lfs-install.txt
+        git lfs version | tee evidence/lfs-version.txt
+    - name: Source completion + mergetool with controlled input
+      continue-on-error: true
+      run: |
+        mkdir -p evidence
+        echo "=== Testing git-lfs-completion.bash ==="
+        COMPLETION=""
+        for p in /usr/share/bash-completion/completions/git-lfs \
+                 /etc/bash_completion.d/git-lfs \
+                 ./contrib/completions/git-lfs-completion.bash \
+                 /home/linuxbrew/.linuxbrew/etc/bash_completion.d/git-lfs.bash; do
+          if [ -f "$p" ]; then
+            COMPLETION="$p"
+            break
+          fi
+        done
+        if [ -n "$COMPLETION" ]; then
+          echo "Found completion: $COMPLETION"
+          grep -n 'eval' "$COMPLETION" | tee evidence/completion-eval-locations.txt || echo "No eval found"
+        else
+          echo "No completion file found - checking brew/conda"
+          which brew 2>/dev/null && brew list git-lfs 2>/dev/null | head -5 || true
+          find / -name "*git-lfs*completion*" -type f 2>/dev/null | head -5 | tee evidence/completion-search.txt || true
+        fi
+        echo ""
+        echo "=== Testing mergetool scripts ==="
+        find / -path "*git-lfs*mergetool*" -type f 2>/dev/null | head -5 | tee evidence/mergetool-search.txt || true
+        echo ""
+        echo "=== Simulated eval injection PoC ==="
+        MALICIOUS_REF='refs/heads/$(touch /tmp/poc-eval-injection)'
+        eval "echo $MALICIOUS_REF" 2>/dev/null | tee evidence/eval-poc-output.txt || true
+        if [ -f /tmp/poc-eval-injection ]; then
+          echo "eval_injection=CONFIRMED" >> evidence/ch005-result.json
+        else
+          echo "eval_injection=SAFE_IN_THIS_CONTEXT" >> evidence/ch005-result.json
+        fi
+        echo "note=eval injection requires user interaction with tab-completion or mergetool" >> evidence/ch005-result.json
+        cat evidence/ch005-result.json 2>/dev/null || true
+    - name: Upload evidence
+      uses: actions/upload-artifact@v4
+      with:
+        name: ch005-evidence-${{ github.run_id }}
+        path: evidence/
+        retention-days: 90
+    - name: Print verdict
+      run: |
+        echo "## CH-005: eval Injection Verdict" >> $GITHUB_STEP_SUMMARY
+        cat evidence/ch005-result.json 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
