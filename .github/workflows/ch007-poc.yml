@@ -45,7 +45,7 @@ jobs:
       with:
         path: .git/lfs
         key: ch007-lfs-${{ github.run_id }}-poison
-    - name: CH-007: Test flawed error handling patterns
+    - name: CH-007 - Test flawed error handling patterns
       continue-on-error: true
       run: |
         mkdir -p evidence
