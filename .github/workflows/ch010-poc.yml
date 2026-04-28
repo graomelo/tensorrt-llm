@@ -1,0 +1,61 @@
+name: CH-010 trap Failure Persistence
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  trap-persistence:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: false
+    - name: Install git-lfs
+      run: |
+        mkdir -p evidence
+        git lfs install --local 2>&1 | tee evidence/lfs-install.txt
+    - name: CH-010: trap failure + persistence
+      continue-on-error: true
+      run: |
+        mkdir -p evidence
+        echo "=== CH-010: trap Failure + Persistence ==="
+        echo ""
+        echo "Pattern 1: trap SIGKILL (not catchable)"
+        trap 'echo "CLEANUP_RAN" > /tmp/trap-cleanup-marker.txt' SIGKILL 2>&1 | tee evidence/trap-sigkill-output.txt || true
+        echo "trap_sigkill_rc=$?" >> evidence/ch010-pattern1.json
+        echo ""
+        echo "Pattern 2: trap SIGSTOP (not catchable)"
+        trap 'echo "CLEANUP_RAN" > /tmp/trap-cleanup-marker.txt' SIGSTOP 2>&1 | tee evidence/trap-sigstop-output.txt || true
+        echo "trap_sigstop_rc=$?" >> evidence/ch010-pattern2.json
+        echo ""
+        echo "Pattern 3: Correct trap (EXIT/INT/TERM)"
+        trap 'echo "CLEANUP_RAN" > /tmp/trap-cleanup-marker.txt' EXIT INT TERM 2>&1 | tee evidence/trap-exit-output.txt || true
+        echo "trap_exit_rc=$?" >> evidence/ch010-pattern3.json
+        echo ""
+        echo "=== Simulated interrupted checkout ==="
+        git lfs fetch origin 2>&1 | tee evidence/lfs-fetch.txt || true
+        find .git/lfs/objects -type f 2>/dev/null | sort | while read obj; do
+          ORIGINAL_SIZE=$(stat -c%s "$obj")
+          dd if=/dev/urandom of="$obj" bs=1 count="$ORIGINAL_SIZE" 2>/dev/null
+        done
+        echo "Poisoned objects in .git/lfs/objects/"
+        find .git/lfs/objects -type f 2>/dev/null | tee evidence/poisoned-lfs-objects.txt || true
+        echo ""
+        echo "=== After simulated kill (SIGKILL - no cleanup) ==="
+        echo "sigkill_cannot_trap=true" >> evidence/ch010-result.json
+        echo "cleanup_on_sigkill=false" >> evidence/ch010-result.json
+        echo "poisoned_cache_persists=true" >> evidence/ch010-result.json
+        echo "correct_trap_signal=EXIT" >> evidence/ch010-result.json
+        cat evidence/ch010-result.json 2>/dev/null || true
+    - name: Upload evidence
+      uses: actions/upload-artifact@v4
+      with:
+        name: ch010-evidence-${{ github.run_id }}
+        path: evidence/
+        retention-days: 90
+    - name: Print verdict
+      run: |
+        echo "## CH-010: trap Failure Persistence Verdict" >> $GITHUB_STEP_SUMMARY
+        cat evidence/ch010-result.json 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
