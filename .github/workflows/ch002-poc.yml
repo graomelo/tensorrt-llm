@@ -1,0 +1,99 @@
+name: CH-002 Cross-Repo Contamination
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  job-a-poison:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: false
+    - name: Fetch LFS objects
+      env:
+        GIT_LFS_SKIP_SMUDGE: "1"
+      run: |
+        mkdir -p evidence
+        git lfs install --local
+        git lfs fetch origin 2>&1 | tee evidence/job-a-lfs-fetch.txt
+        git lfs checkout 2>/dev/null || true
+        for f in $(git lfs ls-files 2>/dev/null | awk '{print $2}' | head -5); do
+          if [ -f "$f" ]; then
+            sha256sum "$f" >> evidence/job-a-baseline-hashes.txt 2>/dev/null || true
+          fi
+        done
+    - name: Poison all LFS objects (Job A)
+      run: |
+        mkdir -p evidence
+        echo "=== CH-002: Job A plants poison ==="
+        find .git/lfs/objects -type f 2>/dev/null | sort | while read obj; do
+          ORIGINAL_SIZE=$(stat -c%s "$obj")
+          ORIGINAL_SHA=$(sha256sum "$obj" | awk '{print $1}')
+          dd if=/dev/urandom of="$obj" bs=1 count="$ORIGINAL_SIZE" 2>/dev/null
+          POISON_SHA=$(sha256sum "$obj" | awk '{print $1}')
+          echo "$obj original=$ORIGINAL_SHA poison=$POISON_SHA size=$ORIGINAL_SIZE" >> evidence/job-a-poison-manifest.txt
+        done
+    - name: Save poisoned LFS cache (shared key)
+      uses: actions/cache/save@v4
+      with:
+        path: .git/lfs
+        key: ch002-shared-lfs-cache
+    - name: Upload Job A evidence
+      uses: actions/upload-artifact@v4
+      with:
+        name: ch002-job-a-${{ github.run_id }}
+        path: evidence/
+        retention-days: 90
+
+  job-b-consume:
+    needs: job-a-poison
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        lfs: false
+    - name: Restore poisoned LFS cache from Job A
+      uses: actions/cache/restore@v4
+      with:
+        path: .git/lfs
+        key: ch002-shared-lfs-cache
+    - name: Job B: git lfs fetch + checkout (trusts pre-existing objects)
+      continue-on-error: true
+      run: |
+        mkdir -p evidence
+        git lfs install --local
+        echo "=== .git/lfs/objects BEFORE fetch ==="
+        find .git/lfs/objects -type f 2>/dev/null | head -10 | tee evidence/job-b-objects-before.txt
+        git lfs fetch origin 2>&1 | tee evidence/job-b-lfs-fetch.txt || true
+        git lfs checkout 2>&1 | tee evidence/job-b-lfs-checkout.txt || true
+        echo "lfs_checkout_rc=$?" >> evidence/job-b-checkout-rc.txt
+    - name: V2 - Cross-repo contamination check
+      run: |
+        mkdir -p evidence
+        echo "=== CH-002: Job B receives poison from Job A ==="
+        LFS_RC=$(cat evidence/job-b-checkout-rc.txt 2>/dev/null | tr -dc '0-9' | tail -c1)
+        for f in $(git lfs ls-files 2>/dev/null | awk '{print $2}' | head -5); do
+          if [ -f "$f" ]; then
+            POINTER_OID=$(git cat-file -p "HEAD:$f" 2>/dev/null | grep 'oid sha256:' | sed 's/oid sha256://' | tr -d '[:space:]')
+            ACTUAL_SHA=$(sha256sum "$f" 2>/dev/null | awk '{print $1}')
+            MATCH="false"
+            if [ -n "$POINTER_OID" ] && [ "$ACTUAL_SHA" = "$POINTER_OID" ]; then
+              MATCH="true"
+            fi
+            echo "file=$f pointer_oid=$POINTER_OID actual_sha=$ACTUAL_SHA oid_match=$MATCH lfs_checkout_rc=$LFS_RC" >> evidence/ch002-result.json
+          fi
+        done
+        cat evidence/ch002-result.json 2>/dev/null || true
+    - name: Upload Job B evidence
+      uses: actions/upload-artifact@v4
+      with:
+        name: ch002-job-b-${{ github.run_id }}
+        path: evidence/
+        retention-days: 90
+    - name: Print verdict
+      run: |
+        echo "## CH-002: Cross-Repo Contamination Verdict" >> $GITHUB_STEP_SUMMARY
+        cat evidence/ch002-result.json 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
