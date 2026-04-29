@@ -44,7 +44,7 @@ jobs:
           echo "=== git lfs ls-files --json ==="
           git lfs ls-files --json 2>/dev/null | tee evidence/lfs-ls-files.json || echo "{}" > evidence/lfs-ls-files.json
           echo "=== LFS file hashes ==="
-          git lfs ls-files --json 2>/dev/null | jq -r '.Files[] | "\(.oid) \(.name)"' | while read oid name; do
+          git lfs ls-files --json 2>/dev/null | jq -r '(.Files // .files)[] | "\(.oid) \(.name)"' | while read oid name; do
             if [ -f "$name" ]; then
               FILE_SHA=$(sha256sum "$name" | awk '{print $1}')
               echo "name=$name pointer_oid=$oid worktree_sha256=$FILE_SHA" | tee -a evidence/baseline-hashes.txt
@@ -96,7 +96,7 @@ jobs:
           set -euo pipefail
           mkdir -p evidence
           echo "=== Extracting pointer OIDs via git lfs ls-files --json ==="
-          git lfs ls-files --json 2>/dev/null | jq -r '.Files[] | "\(.oid) \(.size) \(.name)"' | while read oid size name; do
+          git lfs ls-files --json 2>/dev/null | jq -r '(.Files // .files)[] | "\(.oid) \(.size) \(.name)"' | while read oid size name; do
             echo "LFS file: name=$name pointer_oid=$oid size=$size"
             echo "name=$name pointer_oid=$oid size=$size" >> evidence/poison-targets.txt
           done
@@ -161,7 +161,7 @@ jobs:
           mkdir -p evidence
           echo "=== Extracting pointer OIDs BEFORE checkout (from Git index) ==="
           git lfs ls-files --json 2>/dev/null | tee evidence/pointer-oids-raw.json || echo "{}" > evidence/pointer-oids-raw.json
-          git lfs ls-files --json 2>/dev/null | jq -r '.Files[] | "\(.oid) \(.name)"' | while read oid name; do
+          git lfs ls-files --json 2>/dev/null | jq -r '(.Files // .files)[] | "\(.oid) \(.name)"' | while read oid name; do
             echo "pointer_oid=$oid name=$name" >> evidence/pointer-oids-extracted.txt
           done
           echo "Pointer OID extraction complete"
