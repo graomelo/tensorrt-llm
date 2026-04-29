@@ -49,7 +49,7 @@ jobs:
           echo ""
           echo "=== Repo A LFS files (baseline) ==="
           git lfs ls-files --json 2>/dev/null | tee evidence/repo-a-lfs-files.json || echo "{}" > evidence/repo-a-lfs-files.json
-          git lfs ls-files --json 2>/dev/null | jq -r '.Files[] | "\(.oid) \(.size) \(.name)"' | while read oid size name; do
+          git lfs ls-files --json 2>/dev/null | jq -r '(.Files // .files)[] | "\(.oid) \(.size) \(.name)"' | while read oid size name; do
             if [ -f "$name" ]; then
               FILE_SHA=$(sha256sum "$name" | awk '{print $1}')
               echo "name=$name pointer_oid=$oid worktree_sha256=$FILE_SHA size=$size" | tee -a evidence/repo-a-baseline-hashes.txt
@@ -133,7 +133,7 @@ jobs:
           mkdir -p evidence
           echo "=== Extracting pointer OIDs BEFORE checkout ==="
           git lfs ls-files --json 2>/dev/null | tee evidence/repo-b-pointer-oids-raw.json || echo "{}" > evidence/repo-b-pointer-oids-raw.json
-          git lfs ls-files --json 2>/dev/null | jq -r '.Files[] | "\(.oid) \(.name)"' | while read oid name; do
+          git lfs ls-files --json 2>/dev/null | jq -r '(.Files // .files)[] | "\(.oid) \(.name)"' | while read oid name; do
             echo "pointer_oid=$oid name=$name" >> evidence/repo-b-pointer-oids-extracted.txt
           done
           echo "Pointer OID extraction complete"
