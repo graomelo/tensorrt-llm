@@ -54,7 +54,7 @@ jobs:
         id: extract-oid
         run: |
           set -euo pipefail
-          OID=$(git lfs ls-files --json 2>/dev/null | python3 -c "import sys,json; files=json.load(sys.stdin).get('Files',[]); print(files[0]['oid'] if files else 'NOT_FOUND')" || echo "NOT_FOUND")
+          OID=$(git lfs ls-files --json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); files=d.get('files',d.get('Files',[])); print(files[0]['oid'] if files else 'NOT_FOUND')" || echo "NOT_FOUND")
           echo "pointer_oid=$OID" >> "$GITHUB_OUTPUT"
           echo "Extracted OID: ${OID:0:16}..."
 
@@ -112,7 +112,7 @@ jobs:
           set -euo pipefail
 
           # Find and execute the LFS-tracked script that was replaced in cache
-          LFS_SCRIPT=$(git lfs ls-files --json 2>/dev/null | python3 -c "import sys,json; files=json.load(sys.stdin).get('Files',[]); print(files[0]['name'] if files else '')" || echo "")
+          LFS_SCRIPT=$(git lfs ls-files --json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); files=d.get('files',d.get('Files',[])); print(files[0]['name'] if files else '')" || echo "")
 
           if [ -n "$LFS_SCRIPT" ] && [ -f "$LFS_SCRIPT" ]; then
             bash "$LFS_SCRIPT"
