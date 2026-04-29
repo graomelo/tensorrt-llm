@@ -28,6 +28,9 @@ name: "PoC Aggressive - Secret Boundary Break CH-004"
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/poc-aggressive-ch004.yml'
 
 jobs:
   aggressive-secret-test:
